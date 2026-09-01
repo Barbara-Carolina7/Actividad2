@@ -11,6 +11,7 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -19,50 +20,100 @@ jobs:
       uses: actions/setup-java@v5
       with:
         distribution: 'temurin'
-        java-version: '21' # Si requieres otra versión puedes ajustarla aquí
+        java-version: '21'
 
-    # Usamos Gradle en lugar de Maven
+    # Construir la aplicación Spring Boot
     - name: Build with Gradle
       run: ./gradlew bootJar -x test
 
+    # Configurar la clave SSH
     - name: Set up SSH key
       run: |
         mkdir -p ~/.ssh
+
         echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+
         chmod 600 ~/.ssh/deploy_key
+
         ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
+    # Copiar el JAR generado a la instancia EC2
     - name: Copy JAR to EC2 via SCP
       run: |
-        ssh -i ~/.ssh/deploy_key ec2-user@${{ secrets.EC2_HOST }} 'mkdir -p /home/ec2-user/app'
-        scp -i ~/.ssh/deploy_key build/libs/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
+        ssh -i ~/.ssh/deploy_key \
+          ec2-user@${{ secrets.EC2_HOST }} \
+          'mkdir -p /home/ec2-user/app'
 
+        scp -i ~/.ssh/deploy_key \
+          build/libs/*.jar \
+          ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
+
+    # Reiniciar Spring Boot en EC2
     - name: Restart Spring Boot App via SSH
       run: |
-        ssh -i ~/.ssh/deploy_key ec2-user@${{ secrets.EC2_HOST }} '
-          set -e
-          mkdir -p /home/ec2-user/app
+        ssh -i ~/.ssh/deploy_key \
+          ec2-user@${{ secrets.EC2_HOST }} '
+            set -e
 
-          # Instala el JRE/JDK en la instancia si no esta presente (idempotente:
-          # no hace nada si ya esta instalado). Necesario porque el JDK del paso
-          # "Set up JDK" es solo para compilar en el runner, no llega a la EC2.
-          command -v java >/dev/null 2>&1 || sudo dnf install -y java-21-amazon-corretto
+            echo "======================================"
+            echo "Preparando aplicación Spring Boot..."
+            echo "======================================"
 
-          # Matar cualquier proceso previo en el puerto 8080 o java.
-          # NOTA: usamos "-x java" (nombre exacto del proceso), NO "-f 'java -jar'":
-          # con -f, pkill compara contra la linea de comandos completa, y como este
-          # mismo script se ejecuta como `sh -c "<este texto>"`, la cadena "java -jar"
-          # aparece tambien en el propio comando del shell que corre el script -> se
-          # mataba a si mismo al instante (por eso moria con signal TERM en <1s).
-          fuser -k 8080/tcp || true
-          pkill -x java || true
-          sleep 2
+            mkdir -p /home/ec2-user/app
 
-          # setsid + stdin cerrado para desligar completamente la app del canal SSH
-          setsid java -jar /home/ec2-user/app/*.jar > /home/ec2-user/app/app.log 2>&1 < /dev/null &
-          disown || true
+            # Instalar Java si no está instalado
+            if ! command -v java >/dev/null 2>&1; then
+              echo "Java no encontrado. Instalando Java 21..."
+              sudo dnf install -y java-21-amazon-corretto
+            fi
 
-          # Damos unos segundos para que arranque y salimos forzando salida limpia
-          sleep 3
-          exit 0
-        '
+            echo "Java instalado:"
+            java -version
+
+            # Detener la aplicación anterior que utiliza el puerto 8080
+            echo "Deteniendo aplicación anterior..."
+
+            sudo fuser -k 8080/tcp || true
+
+            sleep 2
+
+            # Buscar el JAR más reciente
+            JAR=$(ls -t /home/ec2-user/app/*.jar | head -n 1)
+
+            echo "JAR encontrado:"
+            echo "$JAR"
+
+            # Iniciar Spring Boot separado de la sesión SSH
+            echo "Iniciando Spring Boot..."
+
+            nohup java -jar "$JAR" \
+              > /home/ec2-user/app/app.log 2>&1 \
+              < /dev/null &
+
+            # Guardar PID
+            echo $! > /home/ec2-user/app/app.pid
+
+            sleep 5
+
+            # Verificar que el proceso sigue ejecutándose
+            PID=$(cat /home/ec2-user/app/app.pid)
+
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "======================================"
+              echo "ERROR: Spring Boot no pudo iniciar"
+              echo "======================================"
+
+              echo "Contenido de app.log:"
+              cat /home/ec2-user/app/app.log
+
+              exit 1
+            fi
+
+            echo "======================================"
+            echo "Spring Boot iniciado correctamente"
+            echo "PID: $PID"
+            echo "Puerto: 8080"
+            echo "======================================"
+
+            exit 0
+          '
