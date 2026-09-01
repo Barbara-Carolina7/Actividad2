@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
     - name: Checkout code
       uses: actions/checkout@v4
 
@@ -22,11 +23,9 @@ jobs:
         distribution: 'temurin'
         java-version: '21'
 
-    # Construir la aplicación Spring Boot
     - name: Build with Gradle
       run: ./gradlew bootJar -x test
 
-    # Configurar la clave SSH
     - name: Set up SSH key
       run: |
         mkdir -p ~/.ssh
@@ -37,83 +36,98 @@ jobs:
 
         ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
-    # Copiar el JAR generado a la instancia EC2
     - name: Copy JAR to EC2 via SCP
       run: |
         ssh -i ~/.ssh/deploy_key \
+          -o ServerAliveInterval=30 \
+          -o ServerAliveCountMax=10 \
           ec2-user@${{ secrets.EC2_HOST }} \
           'mkdir -p /home/ec2-user/app'
 
         scp -i ~/.ssh/deploy_key \
+          -o ServerAliveInterval=30 \
+          -o ServerAliveCountMax=10 \
           build/libs/*.jar \
           ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
 
-    # Reiniciar Spring Boot en EC2
     - name: Restart Spring Boot App via SSH
       run: |
         ssh -i ~/.ssh/deploy_key \
+          -o ServerAliveInterval=30 \
+          -o ServerAliveCountMax=10 \
           ec2-user@${{ secrets.EC2_HOST }} '
             set -e
 
             echo "======================================"
-            echo "Preparando aplicación Spring Boot..."
+            echo "Verificando Java..."
             echo "======================================"
 
-            mkdir -p /home/ec2-user/app
-
-            # Instalar Java si no está instalado
             if ! command -v java >/dev/null 2>&1; then
-              echo "Java no encontrado. Instalando Java 21..."
-              sudo dnf install -y java-21-amazon-corretto
+              echo "ERROR: Java no está instalado en la EC2."
+              echo "Debes instalar Java 21 en la instancia."
+              exit 1
             fi
 
-            echo "Java instalado:"
             java -version
 
-            # Detener la aplicación anterior que utiliza el puerto 8080
+            echo "======================================"
             echo "Deteniendo aplicación anterior..."
+            echo "======================================"
 
             sudo fuser -k 8080/tcp || true
 
-            sleep 2
+            sleep 3
 
-            # Buscar el JAR más reciente
+            echo "======================================"
+            echo "Buscando JAR..."
+            echo "======================================"
+
             JAR=$(ls -t /home/ec2-user/app/*.jar | head -n 1)
+
+            if [ -z "$JAR" ]; then
+              echo "ERROR: No se encontró ningún JAR."
+              exit 1
+            fi
 
             echo "JAR encontrado:"
             echo "$JAR"
 
-            # Iniciar Spring Boot separado de la sesión SSH
+            echo "======================================"
             echo "Iniciando Spring Boot..."
+            echo "======================================"
 
             nohup java -jar "$JAR" \
               > /home/ec2-user/app/app.log 2>&1 \
               < /dev/null &
 
-            # Guardar PID
             echo $! > /home/ec2-user/app/app.pid
 
-            sleep 5
+            sleep 8
 
-            # Verificar que el proceso sigue ejecutándose
             PID=$(cat /home/ec2-user/app/app.pid)
 
             if ! kill -0 "$PID" 2>/dev/null; then
+
               echo "======================================"
               echo "ERROR: Spring Boot no pudo iniciar"
               echo "======================================"
 
               echo "Contenido de app.log:"
+              echo "--------------------------------------"
+
               cat /home/ec2-user/app/app.log
+
+              echo "--------------------------------------"
 
               exit 1
             fi
 
             echo "======================================"
-            echo "Spring Boot iniciado correctamente"
+            echo "DEPLOY COMPLETADO CORRECTAMENTE"
+            echo "======================================"
+
             echo "PID: $PID"
             echo "Puerto: 8080"
-            echo "======================================"
 
             exit 0
           '
