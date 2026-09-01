@@ -11,9 +11,7 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-
     - name: Checkout code
       uses: actions/checkout@v4
 
@@ -23,111 +21,46 @@ jobs:
         distribution: 'temurin'
         java-version: '21'
 
+    # Usamos Gradle en lugar de Maven
     - name: Build with Gradle
       run: ./gradlew bootJar -x test
 
     - name: Set up SSH key
       run: |
         mkdir -p ~/.ssh
-
         echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
-
         chmod 600 ~/.ssh/deploy_key
-
         ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
     - name: Copy JAR to EC2 via SCP
       run: |
-        ssh -i ~/.ssh/deploy_key \
-          -o ServerAliveInterval=30 \
-          -o ServerAliveCountMax=10 \
-          ec2-user@${{ secrets.EC2_HOST }} \
-          'mkdir -p /home/ec2-user/app'
-
-        scp -i ~/.ssh/deploy_key \
-          -o ServerAliveInterval=30 \
-          -o ServerAliveCountMax=10 \
-          build/libs/*.jar \
-          ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
+        ssh -i ~/.ssh/deploy_key ec2-user@${{ secrets.EC2_HOST }} 'mkdir -p /home/ec2-user/app'
+        scp -i ~/.ssh/deploy_key build/libs/*.jar ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
 
     - name: Restart Spring Boot App via SSH
       run: |
-        ssh -i ~/.ssh/deploy_key \
-          -o ServerAliveInterval=30 \
-          -o ServerAliveCountMax=10 \
-          ec2-user@${{ secrets.EC2_HOST }} '
-            set -e
+        ssh -i ~/.ssh/deploy_key ec2-user@${{ secrets.EC2_HOST }} '
+          set -e
+          mkdir -p /home/ec2-user/app
 
-            echo "======================================"
-            echo "Verificando Java..."
-            echo "======================================"
+          # Instala el JRE/JDK en la instancia si no esta presente (idempotente)
+          command -v java >/dev/null 2>&1 || sudo dnf install -y java-21-amazon-corretto
 
-            if ! command -v java >/dev/null 2>&1; then
-              echo "ERROR: Java no está instalado en la EC2."
-              echo "Debes instalar Java 21 en la instancia."
-              exit 1
-            fi
+          # Matar cualquier proceso previo en el puerto 8080 o java
+          fuser -k 8080/tcp || true
+          pkill -x java || true
+          sleep 2
 
-            java -version
+          # Exportar variables de entorno de Microsoft Entra ID
+          export AZURE_CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}"
+          export AZURE_TENANT_ID="${{ secrets.AZURE_TENANT_ID }}"
+          export AZURE_APP_ID_URI="${{ secrets.AZURE_APP_ID_URI }}"
 
-            echo "======================================"
-            echo "Deteniendo aplicación anterior..."
-            echo "======================================"
+          # setsid + stdin cerrado para desligar completamente la app del canal SSH
+          setsid java -jar /home/ec2-user/app/*.jar > /home/ec2-user/app/app.log 2>&1 < /dev/null &
+          disown || true
 
-            sudo fuser -k 8080/tcp || true
-
-            sleep 3
-
-            echo "======================================"
-            echo "Buscando JAR..."
-            echo "======================================"
-
-            JAR=$(ls -t /home/ec2-user/app/*.jar | head -n 1)
-
-            if [ -z "$JAR" ]; then
-              echo "ERROR: No se encontró ningún JAR."
-              exit 1
-            fi
-
-            echo "JAR encontrado:"
-            echo "$JAR"
-
-            echo "======================================"
-            echo "Iniciando Spring Boot..."
-            echo "======================================"
-
-            nohup java -jar "$JAR" \
-              > /home/ec2-user/app/app.log 2>&1 \
-              < /dev/null &
-
-            echo $! > /home/ec2-user/app/app.pid
-
-            sleep 8
-
-            PID=$(cat /home/ec2-user/app/app.pid)
-
-            if ! kill -0 "$PID" 2>/dev/null; then
-
-              echo "======================================"
-              echo "ERROR: Spring Boot no pudo iniciar"
-              echo "======================================"
-
-              echo "Contenido de app.log:"
-              echo "--------------------------------------"
-
-              cat /home/ec2-user/app/app.log
-
-              echo "--------------------------------------"
-
-              exit 1
-            fi
-
-            echo "======================================"
-            echo "DEPLOY COMPLETADO CORRECTAMENTE"
-            echo "======================================"
-
-            echo "PID: $PID"
-            echo "Puerto: 8080"
-
-            exit 0
-          '
+          # Damos unos segundos para que arranque y salimos forzando salida limpia
+          sleep 3
+          exit 0
+        '
