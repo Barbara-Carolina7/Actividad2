@@ -14,7 +14,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 public class HolaController {
 
     @GetMapping("/hello")
-    @PreAuthorize("hasRole('Prueba.Read')")
+    //@PreAuthorize("hasRole('Prueba.Read')")
     public HolaDto sayHello() {
         return new HolaDto("hola mundo");
     }
