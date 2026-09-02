@@ -13,11 +13,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       # ============================================
       # 1. Descargar código
       # ============================================
       - name: Checkout code
         uses: actions/checkout@v4
+
 
       # ============================================
       # 2. Configurar Java 21
@@ -28,17 +30,20 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
+
       # ============================================
       # 3. Dar permisos a Gradle
       # ============================================
       - name: Change permissions
         run: chmod +x gradlew
 
+
       # ============================================
       # 4. Compilar Spring Boot
       # ============================================
       - name: Build with Gradle
         run: ./gradlew bootJar -x test
+
 
       # ============================================
       # 5. Configurar SSH
@@ -48,84 +53,150 @@ jobs:
           set -e
 
           echo "======================================"
-          echo "Configurando SSH..."
+          echo "CONFIGURANDO SSH"
           echo "======================================"
 
           mkdir -p ~/.ssh
 
+          # Comprobar clave SSH
           if [ -z "${{ secrets.EC2_SSH_KEY }}" ]; then
             echo "ERROR: EC2_SSH_KEY está vacío o no existe."
             exit 1
           fi
 
+          # Comprobar host
           if [ -z "${{ secrets.EC2_HOST }}" ]; then
             echo "ERROR: EC2_HOST está vacío o no existe."
             exit 1
           fi
 
+          # Crear archivo de clave privada
           printf '%s\n' "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
 
           chmod 600 ~/.ssh/deploy_key
 
           echo "Clave SSH creada correctamente."
 
-          echo "Comprobando EC2_HOST..."
+
+          echo "======================================"
+          echo "COMPROBANDO EC2_HOST"
+          echo "======================================"
+
+          echo "Host configurado:"
+          echo "${{ secrets.EC2_HOST }}"
+
+
+          echo "======================================"
+          echo "COMPROBANDO DNS"
+          echo "======================================"
+
+          if getent hosts "${{ secrets.EC2_HOST }}"; then
+            echo "DNS OK."
+          else
+            echo "ERROR: No se pudo resolver EC2_HOST."
+            echo "Revisa el valor del Secret EC2_HOST."
+            exit 1
+          fi
+
+
+          echo "======================================"
+          echo "COMPROBANDO PUERTO SSH 22"
+          echo "======================================"
+
+          if timeout 10 bash -c \
+            "cat < /dev/null > /dev/tcp/${{ secrets.EC2_HOST }}/22"
+          then
+            echo "Puerto 22 OK."
+          else
+            echo "ERROR: No se puede conectar al puerto 22."
+            echo "Revisa el Security Group de AWS."
+            exit 1
+          fi
+
+
+          echo "======================================"
+          echo "OBTENIENDO HUELLA SSH"
+          echo "======================================"
 
           ssh-keyscan -T 10 -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
 
           echo "SSH configurado correctamente."
 
+
       # ============================================
-      # 6. Crear carpeta y copiar JAR a EC2
+      # 6. Copiar JAR a EC2
       # ============================================
       - name: Copy JAR to EC2 via SCP
         run: |
           echo "======================================"
-          echo "Copiando aplicación a EC2..."
+          echo "COPIANDO JAR A EC2"
           echo "======================================"
 
           ssh \
             -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
             -i ~/.ssh/deploy_key \
             ec2-user@${{ secrets.EC2_HOST }} \
             'mkdir -p /home/ec2-user/app'
 
           scp \
             -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
             -i ~/.ssh/deploy_key \
             build/libs/*.jar \
             ec2-user@${{ secrets.EC2_HOST }}:/home/ec2-user/app/
 
           echo "JAR copiado correctamente."
 
+
       # ============================================
-      # 7. Reiniciar Spring Boot
+      # 7. Reiniciar aplicación Spring Boot
       # ============================================
       - name: Restart Spring Boot App via SSH
         run: |
           ssh \
             -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
             -i ~/.ssh/deploy_key \
             ec2-user@${{ secrets.EC2_HOST }} '
+            
               set -e
 
               echo "======================================"
-              echo "Preparando aplicación Spring Boot..."
+              echo "PREPARANDO APLICACIÓN SPRING BOOT"
               echo "======================================"
 
               mkdir -p /home/ec2-user/app
 
-              # Instalar Java 21 si no está instalado
+
+              # --------------------------------------------
+              # Comprobar / instalar Java
+              # --------------------------------------------
+
+              echo "Comprobando Java..."
+
               if ! command -v java >/dev/null 2>&1; then
-                echo "Java no está instalado. Instalando..."
+
+                echo "Java no está instalado."
+                echo "Instalando Java 21..."
+
                 sudo dnf install -y java-21-amazon-corretto
+
               else
+
                 echo "Java ya está instalado."
+
                 java -version
+
               fi
 
+
+              # --------------------------------------------
+              # Detener aplicación anterior
+              # --------------------------------------------
+
               echo "======================================"
-              echo "Deteniendo aplicación anterior..."
+              echo "DETENIENDO APLICACIÓN ANTERIOR"
               echo "======================================"
 
               # Liberar puerto 8080
@@ -136,18 +207,39 @@ jobs:
 
               sleep 2
 
+
+              # --------------------------------------------
+              # Buscar JAR
+              # --------------------------------------------
+
               echo "======================================"
-              echo "Iniciando Spring Boot..."
+              echo "BUSCANDO ARCHIVO JAR"
               echo "======================================"
 
-              JAR_FILE=$(find /home/ec2-user/app -maxdepth 1 -name "*.jar" | head -n 1)
+              JAR_FILE=$(find /home/ec2-user/app \
+                -maxdepth 1 \
+                -name "*.jar" \
+                -type f \
+                | head -n 1)
 
               if [ -z "$JAR_FILE" ]; then
+
                 echo "ERROR: No se encontró ningún archivo JAR."
                 exit 1
+
               fi
 
-              echo "JAR encontrado: $JAR_FILE"
+              echo "JAR encontrado:"
+              echo "$JAR_FILE"
+
+
+              # --------------------------------------------
+              # Iniciar Spring Boot
+              # --------------------------------------------
+
+              echo "======================================"
+              echo "INICIANDO SPRING BOOT"
+              echo "======================================"
 
               setsid java -jar "$JAR_FILE" \
                 > /home/ec2-user/app/app.log 2>&1 \
@@ -155,22 +247,64 @@ jobs:
 
               disown || true
 
+
+              # --------------------------------------------
+              # Esperar inicio
+              # --------------------------------------------
+
+              echo "Esperando que Spring Boot inicie..."
+
               sleep 5
 
+
+              # --------------------------------------------
+              # Verificar proceso
+              # --------------------------------------------
+
               echo "======================================"
-              echo "Verificando aplicación..."
+              echo "VERIFICANDO APLICACIÓN"
               echo "======================================"
 
               if pgrep -x java >/dev/null; then
+
                 echo "Spring Boot está ejecutándose correctamente."
+
               else
+
                 echo "ERROR: Spring Boot no está ejecutándose."
-                echo "Últimas líneas del log:"
+
+                echo "======================================"
+                echo "ÚLTIMAS LÍNEAS DEL LOG"
+                echo "======================================"
+
                 tail -n 50 /home/ec2-user/app/app.log || true
+
                 exit 1
+
               fi
 
+
+              # --------------------------------------------
+              # Verificar puerto 8080
+              # --------------------------------------------
+
               echo "======================================"
-              echo "DEPLOY FINALIZADO"
+              echo "VERIFICANDO PUERTO 8080"
               echo "======================================"
+
+              if fuser 8080/tcp >/dev/null 2>&1; then
+
+                echo "Puerto 8080 está activo."
+
+              else
+
+                echo "ADVERTENCIA: El puerto 8080 todavía no aparece activo."
+
+              fi
+
+
+              echo "======================================"
+              echo "DEPLOY FINALIZADO CORRECTAMENTE"
+              echo "======================================"
+
             '
